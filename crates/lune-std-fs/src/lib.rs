@@ -1,7 +1,10 @@
 #![allow(clippy::cargo_common_metadata)]
 
+use std::fs::File;
 use std::io::ErrorKind as IoErrorKind;
+use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use bstr::{BString, ByteSlice};
 use mlua::prelude::*;
@@ -27,6 +30,7 @@ use self::options::FsWriteOptions;
 pub fn module(lua: &Lua) -> LuaResult<LuaTable> {
     TableBuilder::new(lua)?
         .with_async_function("readFile", fs_read_file)?
+        .with_async_function("readLines", fs_read_lines)?
         .with_async_function("readDir", fs_read_dir)?
         .with_async_function("writeFile", fs_write_file)?
         .with_async_function("writeDir", fs_write_dir)?
@@ -44,6 +48,40 @@ async fn fs_read_file(lua: &Lua, path: String) -> LuaResult<LuaString> {
     let bytes = fs::read(&path).await.into_lua_err()?;
 
     lua.create_string(bytes)
+}
+
+async fn fs_read_lines(lua: &Lua, path: String) -> LuaResult<LuaFunction> {
+    let file = match File::open(&path) {
+        Ok(file) => file,
+        Err(e) => return Err(LuaError::RuntimeError(format!("Error opening file: {}", e))),
+    };
+
+    let reader = BufReader::new(file);
+    let lines = Arc::new(Mutex::new(reader.lines()));
+
+    lua.create_async_function(move |_lua, ()| {
+        let lines = Arc::clone(&lines);
+
+        async move {
+            let mut locked_lines = match lines.lock() {
+                Ok(lines) => lines,
+                Err(e) => {
+                    return Err(LuaError::RuntimeError(format!(
+                        "Error locking lines: {}",
+                        e
+                    )))
+                }
+            };
+            match locked_lines.next() {
+                Some(Ok(line)) => Ok(Some(line)),
+                Some(Err(e)) => Err(LuaError::RuntimeError(format!("Error reading line: {}", e))),
+                None => {
+                    drop(locked_lines);
+                    Ok(None)
+                }
+            }
+        }
+    })
 }
 
 async fn fs_read_dir(_: &Lua, path: String) -> LuaResult<Vec<String>> {
